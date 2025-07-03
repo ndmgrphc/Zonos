@@ -486,6 +486,9 @@ class Zonos(nn.Module):
                         logfade /= logfade.max()
                         current_audio[..., :size] *= logfade.flip(0)
 
+                    # Stream the chunk **except** its final `overlap` samples.
+                    # Those tail samples will cross-fade into the next chunk
+                    # (or be sent once, at the very end).
                     yield current_audio[..., :-overlap]
 
                     # Store current audio for next iteration and update counters
@@ -519,5 +522,6 @@ class Zonos(nn.Module):
                 yield curr_text
 
         # Don't forget to yield the final audio chunk
-        if previous_audio is not None:
-            yield previous_audio
+        # Only the *un-sent* tail of the very last chunk is yielded here.
+        if previous_audio is not None and chunk_overlap > 0:
+            yield previous_audio[..., -overlap:]
