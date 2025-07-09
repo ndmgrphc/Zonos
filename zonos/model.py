@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm
+import time
+import logging
 
 from zonos.autoencoder import DACAutoencoder
 from zonos.backbone import BACKBONES
@@ -19,6 +21,9 @@ from zonos.utils import DEFAULT_DEVICE, find_multiple, pad_weight_
 DEFAULT_BACKBONE_CLS = next(iter(BACKBONES.values()))
 UNKNOWN_TOKEN = -1
 
+# Configure logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 class Zonos(nn.Module):
     def __init__(self, config: ZonosConfig, backbone_cls=DEFAULT_BACKBONE_CLS):
@@ -339,22 +344,18 @@ class Zonos(nn.Module):
     ) -> Generator[torch.Tensor | str, None, None]:
         """
         Stream audio generation in chunks with smooth transitions between chunks.
-
-        Args:
-            cond_dicts_generator: Generator of conditioning dictionaries
-            audio_prefix_codes: Optional audio prefix codes
-            max_new_tokens: Maximum number of new tokens to generate
-            cfg_scale: Classifier-free guidance scale
-            sampling_params: Parameters for sampling from logits
-            disable_torch_compile: Whether to disable torch.compile
-            chunk_schedule: List of chunk sizes to use in sequence (will use the last size for remaining chunks)
-            chunk_overlap: Number of tokens to overlap between chunks (also determines audio crossfade size)
-            whitespace: Whitespace to use between sentences
-            mark_boundaries: Whether to yield sentence strings as indicators of the sentence end
-
-        Yields:
-            Audio chunks as torch tensors [and sentence strings as indicators of the sentence end if mark_boundaries is True]
         """
+        # Performance tracking
+        method_start = time.time()
+        setup_time = 0
+        inference_time = 0
+        decode_time = 0
+        crossfade_time = 0
+        total_tokens_generated = 0
+        chunk_yield_count = 0
+        
+        logger.info(f"🔍 PERF: stream() started")
+        
         assert cfg_scale != 1, "TODO: add support for cfg_scale=1"
         assert len(chunk_schedule) > 0, "chunk_schedule must not be empty"
         assert all(chunk_overlap * 2 < size for size in chunk_schedule), "overlap must be less than a half of a chunk"
@@ -362,6 +363,9 @@ class Zonos(nn.Module):
         batch_size = 1  # Streaming generation is single-sample only
         device = self.device
 
+        # TIMING: Setup phase
+        setup_start = time.time()
+        
         # Use CUDA Graphs if supported, and torch.compile otherwise.
         cg = self.can_use_cudagraphs()
         decode_one_token = self._decode_one_token
@@ -378,16 +382,25 @@ class Zonos(nn.Module):
         audio_prefix_text = ""
         previous_audio = None
         generator_index = 0
+        
+        setup_time += time.time() - setup_start
+        logger.info(f"🔍 PERF: Initial setup took {setup_time:.4f}s")
 
-        # Main loop: iterate over sentences in the cond_dicts_generator. For each sentence, we'll be streaming audio chunks out.
-        # Once the first sentence is ready, we'll use it's codes as audio_prefix_codes for all the next sentences
+        # Main loop: iterate over sentences in the cond_dicts_generator
         for cond_dict in cond_dicts_generator:
-            # Prepend the conditioning dictionary text with the previous sentence text
+            sentence_start = time.time()
+            logger.info(f"🔍 PERF: Processing sentence {generator_index}")
+            
+            # TIMING: Conditioning setup
+            cond_start = time.time()
             curr_text = cond_dict["text"]
             updated_cond_dict = {**cond_dict, "text": audio_prefix_text + curr_text + whitespace}
-
             prefix_conditioning = self.prepare_conditioning(make_cond_dict(**updated_cond_dict))
+            cond_time = time.time() - cond_start
+            logger.info(f"🔍 PERF: Conditioning setup took {cond_time:.4f}s")
 
+            # TIMING: Memory setup
+            memory_start = time.time()
             prefix_audio_len = 0 if audio_prefix_codes is None else audio_prefix_codes.shape[2]
             audio_seq_len = prefix_audio_len + max_new_tokens
             seq_len = prefix_conditioning.shape[1] + audio_seq_len + 9
@@ -401,9 +414,15 @@ class Zonos(nn.Module):
 
             delayed_codes = apply_delay_pattern(codes, self.masked_token_id)
             delayed_prefix_audio_codes = delayed_codes[..., : prefix_audio_len + 1]
+            memory_time = time.time() - memory_start
+            logger.info(f"🔍 PERF: Memory setup took {memory_time:.4f}s")
 
+            # TIMING: Prefill
+            prefill_start = time.time()
             logits = self._prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params, cfg_scale)
             next_token = sample_from_logits(logits, **sampling_params)
+            prefill_time = time.time() - prefill_start
+            logger.info(f"🔍 PERF: Prefill took {prefill_time:.4f}s")
 
             offset = delayed_prefix_audio_codes.shape[2]
             frame = delayed_codes[..., offset : offset + 1]
@@ -423,20 +442,28 @@ class Zonos(nn.Module):
             max_steps = delayed_codes.shape[2] - offset
             remaining_steps = torch.full((batch_size,), max_steps, device=device)
             step = 0
-            # This variable will let us yield only the new audio since the last yield.
             yielded_len = prefix_audio_len
             chunk_counter = 0
-
-            # For chunk scheduling
             schedule_index = 0
 
+            # Track time to first chunk for this sentence
+            first_chunk_start = time.time()
+            first_chunk_yielded = False
+
             while torch.max(remaining_steps) > 0:
+                # TIMING: Single token inference
+                token_start = time.time()
+                
                 offset += 1
                 input_ids = delayed_codes[..., offset - 1 : offset]
                 logits = decode_one_token(input_ids, inference_params, cfg_scale, allow_cudagraphs=cg)
                 logits += logit_bias
 
                 next_token = sample_from_logits(logits, generated_tokens=delayed_codes[..., :offset], **sampling_params)
+                
+                token_inference_time = time.time() - token_start
+                inference_time += token_inference_time
+                total_tokens_generated += 1
 
                 # Update stopping for finished samples.
                 eos_in_cb0 = next_token[:, 0] == self.eos_token_id
@@ -459,37 +486,58 @@ class Zonos(nn.Module):
                 step += 1
                 chunk_counter += 1
 
-                # --- Every 'chunk_size' tokens (or when finished), decode and yield the new audio ---
-                if (chunk_counter + chunk_overlap + 9 >= chunk_schedule[schedule_index]) or (
-                    torch.all(remaining_steps == 0)
-                ):
-                    # In Zonos, the final output codes are produced by reverting the delay pattern.
-                    # Only tokens up to (offset - 9) are valid.
+                # --- Chunk processing and yielding ---
+                if (chunk_counter + chunk_overlap + 9 >= chunk_schedule[schedule_index]) or (torch.all(remaining_steps == 0)):
+                    chunk_process_start = time.time()
+                    
+                    # TIMING: Code processing
+                    code_start = time.time()
                     full_codes = revert_delay_pattern(delayed_codes)
                     full_codes.masked_fill_(full_codes >= 1024, 0)
-
-                    # Get the valid portion of the latent sequence.
                     valid_length = offset - 9
                     partial_codes = full_codes[..., yielded_len:valid_length]
+                    code_process_time = time.time() - code_start
 
-                    # Decode the current chunk to audio (keep on device)
+                    # TIMING: Audio decoding
+                    decode_start = time.time()
                     current_audio = self.autoencoder.decode(partial_codes)[0]
+                    decode_chunk_time = time.time() - decode_start
+                    decode_time += decode_chunk_time
+
+                    # TIMING: Crossfading
+                    crossfade_start = time.time()
                     size = min(overlap, current_audio.shape[-1])
                     current_audio[..., :size] *= cosfade[-size:]
                     if previous_audio is not None:
                         current_audio[..., :size] += previous_audio[..., -size:] * (1 - cosfade[:size])
 
-                    if schedule_index == 0:  # fade in the first chunk of sentence to smooth the pop
+                    if schedule_index == 0:  # fade in the first chunk of sentence
                         size = min(2 * overlap, current_audio.shape[-1])
                         logfade = torch.logspace(1, 0, size, base=20, device=device)
                         logfade -= logfade.min()
                         logfade /= logfade.max()
                         current_audio[..., :size] *= logfade.flip(0)
+                    crossfade_chunk_time = time.time() - crossfade_start
+                    crossfade_time += crossfade_chunk_time
 
-                    # Stream the chunk **except** its final `overlap` samples.
-                    # Those tail samples will cross-fade into the next chunk
-                    # (or be sent once, at the very end).
+                    chunk_process_time = time.time() - chunk_process_start
+                    
+                    # Log first chunk timing
+                    if not first_chunk_yielded:
+                        ttfa = time.time() - first_chunk_start
+                        logger.info(f"🔍 PERF: *** TTF-A for sentence {generator_index}: {ttfa:.4f}s ***")
+                        first_chunk_yielded = True
+
+                    logger.info(f"🔍 PERF: Chunk {chunk_yield_count} processing: "
+                            f"codes={code_process_time:.4f}s, "
+                            f"decode={decode_chunk_time:.4f}s, "
+                            f"crossfade={crossfade_chunk_time:.4f}s, "
+                            f"total={chunk_process_time:.4f}s, "
+                            f"tokens_in_chunk={chunk_counter}")
+
+                    # Stream the chunk
                     yield current_audio[..., :-overlap]
+                    chunk_yield_count += 1
 
                     # Store current audio for next iteration and update counters
                     previous_audio = current_audio
@@ -500,28 +548,52 @@ class Zonos(nn.Module):
                     if schedule_index < len(chunk_schedule) - 1:
                         schedule_index += 1
 
+            # Handle audio prefix setup for first sentence
             if generator_index == 0:
-                # Assemble the full codes for this sentence and set the audio_prefix_codes to equal first sentence generated audio
+                prefix_setup_start = time.time()
                 audio_prefix_codes = revert_delay_pattern(delayed_codes)
                 audio_prefix_codes.masked_fill_(audio_prefix_codes >= 1024, 0)
                 audio_prefix_codes = audio_prefix_codes[..., : offset - 9]
                 audio_prefix_text = curr_text + whitespace
+                prefix_setup_time = time.time() - prefix_setup_start
+                logger.info(f"🔍 PERF: Audio prefix setup took {prefix_setup_time:.4f}s")
 
+            # Final fade handling
             if previous_audio is not None:
+                fade_start = time.time()
                 size = min(2 * overlap, previous_audio.shape[-1])
                 logfade = torch.logspace(1, 0, size, base=20, device=device)
                 logfade -= logfade.min()
                 logfade /= logfade.max()
                 previous_audio[..., -size:] *= logfade
+                fade_time = time.time() - fade_start
+                logger.info(f"🔍 PERF: Final fade took {fade_time:.4f}s")
 
             self._cg_graph = None  # reset CUDA graph to avoid caching issues
             generator_index += 1
+
+            sentence_time = time.time() - sentence_start
+            logger.info(f"🔍 PERF: Sentence {generator_index-1} complete in {sentence_time:.4f}s")
 
             # Yield the sentence string if mark_boundaries is True
             if mark_boundaries:
                 yield curr_text
 
-        # Don't forget to yield the final audio chunk
-        # Only the *un-sent* tail of the very last chunk is yielded here.
+        # Final chunk yield
         if previous_audio is not None and chunk_overlap > 0:
+            logger.info(f"🔍 PERF: Yielding final chunk tail")
             yield previous_audio[..., -overlap:]
+
+        # Final performance summary
+        total_time = time.time() - method_start
+        avg_token_time = inference_time / total_tokens_generated if total_tokens_generated > 0 else 0
+        
+        logger.info(f"🔍 PERF: === FINAL SUMMARY ===")
+        logger.info(f"🔍 PERF: Total method time: {total_time:.4f}s")
+        logger.info(f"🔍 PERF: Setup time: {setup_time:.4f}s ({setup_time/total_time*100:.1f}%)")
+        logger.info(f"🔍 PERF: Inference time: {inference_time:.4f}s ({inference_time/total_time*100:.1f}%)")
+        logger.info(f"🔍 PERF: Decode time: {decode_time:.4f}s ({decode_time/total_time*100:.1f}%)")
+        logger.info(f"🔍 PERF: Crossfade time: {crossfade_time:.4f}s ({crossfade_time/total_time*100:.1f}%)")
+        logger.info(f"🔍 PERF: Total tokens generated: {total_tokens_generated}")
+        logger.info(f"🔍 PERF: Average time per token: {avg_token_time:.4f}s")
+        logger.info(f"🔍 PERF: Chunks yielded: {chunk_yield_count}")
