@@ -386,6 +386,13 @@ class Zonos(nn.Module):
         setup_time += time.time() - setup_start
         logger.info(f"🔍 PERF: Initial setup took {setup_time:.4f}s")
 
+        logger.info(f"🔍 PERF: Device: {self.device}")
+        logger.info(f"🔍 PERF: Model dtype: {next(self.parameters()).dtype}")
+        logger.info(f"🔍 PERF: CUDA Graphs enabled: {cg}")
+        logger.info(f"🔍 PERF: Torch compile disabled: {disable_torch_compile}")
+        logger.info(f"🔍 PERF: Backbone class: {type(self.backbone)}")
+        logger.info(f"🔍 PERF: Backbone config: {self.config.backbone}")
+
         # Main loop: iterate over sentences in the cond_dicts_generator
         for cond_dict in cond_dicts_generator:
             sentence_start = time.time()
